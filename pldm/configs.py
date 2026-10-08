@@ -1,7 +1,9 @@
 import argparse
 import dataclasses
+import os
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Any, Iterable, Tuple, Union, cast, List, get_origin, get_args
 
 
@@ -9,6 +11,23 @@ from omegaconf import OmegaConf
 
 DataClass = Any
 DataClassType = Any
+
+
+def _hwm_project_root() -> str:
+    """Return the checkout root, optionally overridden for external data.
+
+    Experiment configs use this resolver instead of an author-specific absolute
+    path.  It lets a cloned checkout run without editing YAML files, while
+    retaining ``HWM_PLDM_ROOT`` as an override for users who keep data or
+    checkpoints in another checkout.
+    """
+    override = os.environ.get("HWM_PLDM_ROOT")
+    if override:
+        return str(Path(override).expanduser().resolve())
+    return str(Path(__file__).resolve().parents[1])
+
+
+OmegaConf.register_new_resolver("hwm_root", _hwm_project_root, replace=True)
 
 
 @dataclass

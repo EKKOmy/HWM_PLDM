@@ -1,8 +1,18 @@
 ## Diverse Mazes
 
+All supplied experiment configurations now infer the repository root from the
+checkout. No `/scratch/...` path edits are required after cloning. If your
+datasets or checkpoints live in a different checkout, set
+`HWM_PLDM_ROOT=/absolute/path/to/HWM_PLDM` before launching an experiment.
+
+Run the commands below from the repository root. The data-generation
+scripts save both `data.p` and `images.npy` under
+`pldm_envs/diverse_maze/datasets/`, which is where the supplied configurations
+now look by default.
+
 First, download the pretrained world model weights by running 
 ```
-python download_ckpt_from_hf.py --out-dir <repo_root>/pldm/pretrained
+python -m pldm.download_ckpt_from_hf --out-dir pldm/pretrained
 ```
 
 Which will download two ckpts:
@@ -13,25 +23,25 @@ Which will download two ckpts:
 To evaluate hierarchical planning on the downloaded HWM ckpt:
 
 ```
-python train.py --config configs/diverse_maze/icml/large_diverse_25maps_l2.yaml --values eval_only=true load_l1_only=false load_checkpoint_path=<repo_root>/pldm/pretrained/load_from_l1248-seed248_epoch=5_sample_step=10789632.ckpt
+python -m pldm.train --configs pldm/configs/diverse_maze/icml/large_diverse_25maps_l2.yaml --values eval_only=true load_l1_only=false load_checkpoint_path=pldm/pretrained/load_from_l1248-seed248_epoch=5_sample_step=10789632.ckpt
 ```
 
 To evaluate flat planning on the downloaded PLDM ckpt:
 
 ```
-python train.py --config configs/diverse_maze/icml/large_diverse_25maps.yaml --values eval_only=true load_checkpoint_path=<repo_root>/pldm/pretrained/3-9-1-seed248_epoch=3_sample_step=15465472.ckpt
+python -m pldm.train --configs pldm/configs/diverse_maze/icml/large_diverse_25maps.yaml --values eval_only=true load_checkpoint_path=pldm/pretrained/3-9-1-seed248_epoch=3_sample_step=15465472.ckpt
 ```
 
 To train the HWM (2 levels) on the large-maze setting by loading the downloaded level 1 PLDM model , run:
 
 ```
-python train.py --config configs/diverse_maze/icml/large_diverse_25maps_l2.yaml
+python -m pldm.train --configs pldm/configs/diverse_maze/icml/large_diverse_25maps_l2.yaml
 ```
 
 If you prefer to train the level-1 PLDM world model from scratch, run:
 
 ```
-python train.py --config configs/diverse_maze/icml/large_diverse_25maps.yaml
+python -m pldm.train --configs pldm/configs/diverse_maze/icml/large_diverse_25maps.yaml
 ```
 
 Then later if you want to train a HWM model by loading the newly trained level 1 WM, update `load_checkpoint_path` in `configs/diverse_maze/icml/large_diverse_25maps_l2.yaml` to point to your trained level-1 checkpoint, and run the level-2 training command above.

@@ -62,8 +62,13 @@ conda activate pldm
 
 pip install -r requirements.txt
 
+# Optional: enables imports from outside this checkout. Commands below use
+# `python -m` from the repository root and do not require an editable install.
 pip install -e .
 ```
+
+The bundled checkpoint and dataset downloaders require `huggingface_hub`, which
+is included in `requirements.txt`.
 
 ## MuJoCo 2.1 for d4rl + mujoco-py
 mkdir -p "$HOME/.mujoco"
@@ -79,7 +84,12 @@ export D4RL_SUPPRESS_IMPORT_ERROR=1
 # Run Experiments
 
 1. Go to `pldm_envs/`, follow instructions to set up dataset for the environment of your choice
-2. Go to `pldm/`, follow instruction to run training or evaluation
+2. From the repository root, follow `pldm/readme.md` to run training or evaluation with `python -m pldm.train`
+
+The supplied Diverse Maze configuration is portable: it derives the repository
+root from the installed checkout, and expects generated/downloaded datasets in
+`pldm_envs/diverse_maze/datasets/`. To use another checkout for data or
+checkpoints, set `HWM_PLDM_ROOT` to its absolute path before starting Python.
 
 
 # Datasets

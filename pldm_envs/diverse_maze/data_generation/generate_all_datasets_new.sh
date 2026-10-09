@@ -1,4 +1,5 @@
 # This file generates new datasets for the large diverse maze environments
+set -euo pipefail
 
 # Resolve the checkout root from this script.  Set HWM_PLDM_ROOT only when the
 # datasets should be written to a different checkout.
@@ -6,6 +7,11 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${HWM_PLDM_ROOT:-$(cd -- "${SCRIPT_DIR}/../../.." && pwd)}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 export PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+
+if ! "${PYTHON_BIN}" -c "import d4rl.pointmaze"; then
+    echo "D4RL/MuJoCo cannot be imported. Verify MUJOCO_PY_MUJOCO_PATH and LD_LIBRARY_PATH before generating data." >&2
+    exit 1
+fi
 
 # Generate dataset for 25maps setting.
 "${PYTHON_BIN}" "${PROJECT_ROOT}/pldm_envs/diverse_maze/data_generation/generate_data.py" --output_path "${PROJECT_ROOT}/pldm_envs/diverse_maze/datasets/maze2d_large_diverse_25maps" --config "${PROJECT_ROOT}/pldm_envs/diverse_maze/configs/maze2d_large/25maps.yaml"

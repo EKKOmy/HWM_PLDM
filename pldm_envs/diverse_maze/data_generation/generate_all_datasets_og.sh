@@ -8,11 +8,31 @@ PROJECT_ROOT="${HWM_PLDM_ROOT:-$(cd -- "${SCRIPT_DIR}/../../.." && pwd)}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RENDER_WORKERS="${RENDER_WORKERS:-1}"
 RENDER_GPU_IDS="${RENDER_GPU_IDS:-}"
+RENDER_VERIFY_EXISTING="${RENDER_VERIFY_EXISTING:-0}"
+POSTPROCESS_WORKERS="${POSTPROCESS_WORKERS:-32}"
+POSTPROCESS_BATCH_EPISODES="${POSTPROCESS_BATCH_EPISODES:-32}"
 export PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 if ! [[ "${RENDER_WORKERS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "RENDER_WORKERS must be a positive integer, got: ${RENDER_WORKERS}" >&2
     exit 1
+fi
+
+if ! [[ "${RENDER_VERIFY_EXISTING}" =~ ^[01]$ ]]; then
+    echo "RENDER_VERIFY_EXISTING must be 0 or 1, got: ${RENDER_VERIFY_EXISTING}" >&2
+    exit 1
+fi
+
+for value_name in POSTPROCESS_WORKERS POSTPROCESS_BATCH_EPISODES; do
+    if ! [[ "${!value_name}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "${value_name} must be a positive integer, got: ${!value_name}" >&2
+        exit 1
+    fi
+done
+
+RENDER_VERIFY_ARGS=()
+if (( RENDER_VERIFY_EXISTING )); then
+    RENDER_VERIFY_ARGS+=(--verify_existing)
 fi
 
 RENDER_GPU_LIST=()
@@ -61,9 +81,14 @@ render_dataset() {
 
     if (( RENDER_WORKERS == 1 )); then
         "${PYTHON_BIN}" "${PROJECT_ROOT}/pldm_envs/diverse_maze/data_generation/render_data.py" \
-            --data_path "${data_path}"
+            --data_path "${data_path}" \
+            ${RENDER_VERIFY_ARGS[@]+"${RENDER_VERIFY_ARGS[@]}"}
     else
         echo "Rendering ${data_path} with ${RENDER_WORKERS} worker processes"
+        # Background workers otherwise outlive this script when it receives
+        # Ctrl+C.  Install the handler before starting them so an interrupted
+        # rendering run can be resumed without orphaned renderers.
+        trap 'echo "Interrupt received; stopping rendering workers..." >&2; kill "${pids[@]}" 2>/dev/null || true; wait "${pids[@]}" 2>/dev/null || true; exit 130' INT TERM
         for worker_id in $(seq 0 $((RENDER_WORKERS - 1))); do
             if (( ${#RENDER_GPU_LIST[@]} )); then
                 gpu_id="${RENDER_GPU_LIST[$((worker_id % ${#RENDER_GPU_LIST[@]}))]}"
@@ -72,12 +97,14 @@ render_dataset() {
                     "${PYTHON_BIN}" "${PROJECT_ROOT}/pldm_envs/diverse_maze/data_generation/render_data.py" \
                     --data_path "${data_path}" \
                     --workers_num "${RENDER_WORKERS}" \
-                    --worker_id "${worker_id}" &
+                    --worker_id "${worker_id}" \
+                    ${RENDER_VERIFY_ARGS[@]+"${RENDER_VERIFY_ARGS[@]}"} &
             else
                 "${PYTHON_BIN}" "${PROJECT_ROOT}/pldm_envs/diverse_maze/data_generation/render_data.py" \
                     --data_path "${data_path}" \
                     --workers_num "${RENDER_WORKERS}" \
-                    --worker_id "${worker_id}" &
+                    --worker_id "${worker_id}" \
+                    ${RENDER_VERIFY_ARGS[@]+"${RENDER_VERIFY_ARGS[@]}"} &
             fi
             pids+=("$!")
         done
@@ -92,10 +119,13 @@ render_dataset() {
                 return 1
             fi
         done
+        trap - INT TERM
     fi
 
     "${PYTHON_BIN}" "${PROJECT_ROOT}/pldm_envs/diverse_maze/data_generation/postprocess_images.py" \
-        --data_path "${data_path}"
+        --data_path "${data_path}" \
+        --num_workers "${POSTPROCESS_WORKERS}" \
+        --batch_episodes "${POSTPROCESS_BATCH_EPISODES}"
 }
 
 # Render each dataset, then combine its PNGs into images.npy.

@@ -11,10 +11,25 @@ from pldm_envs.diverse_maze import maze_draw
 
 
 def save_image(array, path):
-    # Convert the numpy array to an image
-    image = Image.fromarray(np.uint8(array))
-    # Save the image in png format
-    image.save(path, format="png")
+    """Save a PNG atomically so interruption cannot leave a corrupt file."""
+    path = Path(path)
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        image = Image.fromarray(np.uint8(array))
+        image.save(temporary_path, format="png")
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def image_is_valid(path):
+    try:
+        with Image.open(path) as image:
+            image.verify()
+        return True
+    except Exception:
+        return False
 
 
 def main():
@@ -23,6 +38,11 @@ def main():
     parser.add_argument("--workers_num", type=int, default=1)
     parser.add_argument("--worker_id", type=int, default=0)
     parser.add_argument("--save_replace", action="store_true")
+    parser.add_argument(
+        "--verify_existing",
+        action="store_true",
+        help="Verify existing PNGs and re-render missing or corrupt files",
+    )
     parser.add_argument("--quick_debug", action="store_true")
 
     args = parser.parse_args()
@@ -33,10 +53,10 @@ def main():
     proprio_path = data_path / "data.p"
 
     config_path = data_path / "metadata.pt"
-    config = torch.load(config_path)
+    config = torch.load(config_path, weights_only=False)
 
     # all_splits = d4rl_ds.splits
-    all_splits = torch.load(proprio_path)
+    all_splits = torch.load(proprio_path, weights_only=False)
 
     total_splits = len(all_splits)
     print(f"{total_splits=}")
@@ -60,7 +80,7 @@ def main():
     if "diverse" in config["env"]:
         # retrieve map metadata for generating custom environments
         map_metadata_path = data_path / "train_maps.pt"
-        map_metadata = torch.load(map_metadata_path)
+        map_metadata = torch.load(map_metadata_path, weights_only=False)
     else:
         env = ant_draw.load_environment(config["env"])
         drawer = maze_draw.create_drawer(env, env.name)
@@ -68,20 +88,24 @@ def main():
     for split_idx in indices:
         split = all_splits[split_idx]
         map_idx = split["map_idx"]
-
-        if "diverse" in config["env"]:
-            env = ant_draw.load_environment(
-                name=f"{config['env']}_{map_idx}", map_key=map_metadata[map_idx]
-            )
-            drawer = maze_draw.create_drawer(env, env.name)
+        last_image = None
+        split_drawer = None if "diverse" in config["env"] else drawer
 
         for img_idx, obs in tqdm(enumerate(split["observations"])):
             image_path = output_image_path / f"{split_idx}_{img_idx}.png"
-            if os.path.exists(image_path) and not args.save_replace:
-                continue
+            if image_path.exists() and not args.save_replace:
+                if not args.verify_existing or image_is_valid(image_path):
+                    continue
+                print(f"Re-rendering corrupt image: {image_path}")
 
-            image = drawer.render_state(obs)
-            save_image(image, image_path)
+            if split_drawer is None:
+                env = ant_draw.load_environment(
+                    name=f"{config['env']}_{map_idx}",
+                    map_key=map_metadata[map_idx],
+                )
+                split_drawer = maze_draw.create_drawer(env, env.name)
+            last_image = split_drawer.render_state(obs)
+            save_image(last_image, image_path)
 
             if args.quick_debug and img_idx > 10:
                 break
@@ -91,7 +115,15 @@ def main():
         if os.path.exists(image_folder):
             img_sample_path = image_folder / "image_sample.png"
             if not img_sample_path.exists() or args.save_replace:
-                save_image(image, img_sample_path)
+                if last_image is None:
+                    if split_drawer is None:
+                        env = ant_draw.load_environment(
+                            name=f"{config['env']}_{map_idx}",
+                            map_key=map_metadata[map_idx],
+                        )
+                        split_drawer = maze_draw.create_drawer(env, env.name)
+                    last_image = split_drawer.render_state(split["observations"][-1])
+                save_image(last_image, img_sample_path)
 
         if args.quick_debug and split_idx > 10:
             break

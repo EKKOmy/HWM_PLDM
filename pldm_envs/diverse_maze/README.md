@@ -9,8 +9,8 @@ bash data_generation/generate_all_datasets_og.sh
 ```
 
 The renderer is single-process by default. To resume an interrupted rendering
-run with multiple processes, choose a worker count that divides both dataset
-sizes (for example 8, 10, or 20):
+run with multiple processes, set any positive worker count; uneven dataset
+sizes are distributed across workers automatically:
 
 ```
 RENDER_WORKERS=8 bash data_generation/generate_all_datasets_og.sh
@@ -22,6 +22,17 @@ indices as `RENDER_GPU_IDS`:
 
 ```
 RENDER_WORKERS=8 RENDER_GPU_IDS=1,2,3 bash data_generation/generate_all_datasets_og.sh
+```
+
+After an interrupted renderer, validate existing PNGs once so truncated files
+are re-rendered. Post-processing reads the true episode count from `data.p`,
+writes directly to a resumable `images.partial.npy`, and renames it to
+`images.npy` only after successful completion:
+
+```
+RENDER_WORKERS=12 RENDER_GPU_IDS=1,2,3 RENDER_VERIFY_EXISTING=1 \
+POSTPROCESS_WORKERS=32 POSTPROCESS_BATCH_EPISODES=32 \
+bash data_generation/generate_all_datasets_og.sh
 ```
 
 Note that rendering code can take a while. One can split the work across multiple CPUs by using the `--workers_num` and `worker_id` flags in `data_generation/render_data.py`

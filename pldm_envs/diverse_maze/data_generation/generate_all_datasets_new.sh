@@ -7,11 +7,23 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="${HWM_PLDM_ROOT:-$(cd -- "${SCRIPT_DIR}/../../.." && pwd)}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 RENDER_WORKERS="${RENDER_WORKERS:-1}"
+RENDER_GPU_IDS="${RENDER_GPU_IDS:-}"
 export PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 if ! [[ "${RENDER_WORKERS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "RENDER_WORKERS must be a positive integer, got: ${RENDER_WORKERS}" >&2
     exit 1
+fi
+
+RENDER_GPU_LIST=()
+if [[ -n "${RENDER_GPU_IDS}" ]]; then
+    IFS=',' read -r -a RENDER_GPU_LIST <<< "${RENDER_GPU_IDS}"
+    for gpu_id in "${RENDER_GPU_LIST[@]}"; do
+        if ! [[ "${gpu_id}" =~ ^[0-9]+$ ]]; then
+            echo "RENDER_GPU_IDS must be comma-separated GPU indices, got: ${RENDER_GPU_IDS}" >&2
+            exit 1
+        fi
+    done
 fi
 
 if ! "${PYTHON_BIN}" -c "import d4rl.pointmaze"; then
@@ -34,6 +46,7 @@ render_dataset() {
     local data_path="$1"
     local worker_id
     local pid
+    local gpu_id
     local pids=()
 
     if (( RENDER_WORKERS == 1 )); then
@@ -42,10 +55,20 @@ render_dataset() {
     else
         echo "Rendering ${data_path} with ${RENDER_WORKERS} worker processes"
         for worker_id in $(seq 0 $((RENDER_WORKERS - 1))); do
-            "${PYTHON_BIN}" "${PROJECT_ROOT}/pldm_envs/diverse_maze/data_generation/render_data.py" \
-                --data_path "${data_path}" \
-                --workers_num "${RENDER_WORKERS}" \
-                --worker_id "${worker_id}" &
+            if (( ${#RENDER_GPU_LIST[@]} )); then
+                gpu_id="${RENDER_GPU_LIST[$((worker_id % ${#RENDER_GPU_LIST[@]}))]}"
+                echo "  worker ${worker_id} -> GPU ${gpu_id}"
+                CUDA_VISIBLE_DEVICES="${gpu_id}" MUJOCO_EGL_DEVICE_ID="${gpu_id}" \
+                    "${PYTHON_BIN}" "${PROJECT_ROOT}/pldm_envs/diverse_maze/data_generation/render_data.py" \
+                    --data_path "${data_path}" \
+                    --workers_num "${RENDER_WORKERS}" \
+                    --worker_id "${worker_id}" &
+            else
+                "${PYTHON_BIN}" "${PROJECT_ROOT}/pldm_envs/diverse_maze/data_generation/render_data.py" \
+                    --data_path "${data_path}" \
+                    --workers_num "${RENDER_WORKERS}" \
+                    --worker_id "${worker_id}" &
+            fi
             pids+=("$!")
         done
 

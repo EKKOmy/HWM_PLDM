@@ -8,6 +8,16 @@ Run the following script to download the proprioceptive data, and render the obs
 bash data_generation/generate_all_datasets_og.sh
 ```
 
+The renderer is single-process by default. To resume an interrupted rendering
+run with multiple processes, choose a worker count that divides both dataset
+sizes (for example 8, 10, or 20):
+
+```
+RENDER_WORKERS=8 bash data_generation/generate_all_datasets_og.sh
+```
+
+Existing PNG frames are skipped, so this safely resumes partial output.
+
 Note that rendering code can take a while. One can split the work across multiple CPUs by using the `--workers_num` and `worker_id` flags in `data_generation/render_data.py`
 
 The data will be saved `datasets/` by default.
@@ -19,4 +29,3 @@ The following scripts will generate datasets for the large diverse maps setting.
 ```
 bash data_generation/generate_all_datasets_new.sh
 ```
-

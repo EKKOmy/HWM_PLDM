@@ -38,19 +38,24 @@ def main():
     # all_splits = d4rl_ds.splits
     all_splits = torch.load(proprio_path)
 
-    print(f"{len(all_splits)=}")
-    if args.workers_num is None:
-        indices = np.arange(len(all_splits))
-    else:
-        per_worker = len(all_splits) // args.workers_num
-        print(f"per_worker: {per_worker}")
-        assert per_worker * args.workers_num == len(
-            all_splits
-        ), "Number of splits must be divisible by number of workers"
-        start = per_worker * args.worker_id
-        end = start + per_worker
-        print(f"start: {start}, end: {end}")
-        indices = np.arange(start, end)
+    total_splits = len(all_splits)
+    print(f"{total_splits=}")
+    if args.workers_num < 1:
+        parser.error("--workers_num must be a positive integer")
+    if not 0 <= args.worker_id < args.workers_num:
+        parser.error("--worker_id must be in [0, --workers_num)")
+
+    # Give every worker a contiguous, non-overlapping slice.  The first
+    # `remainder` workers process one additional split, so no dataset is
+    # skipped when its size is not divisible by the worker count.
+    splits_per_worker, remainder = divmod(total_splits, args.workers_num)
+    start = args.worker_id * splits_per_worker + min(args.worker_id, remainder)
+    end = start + splits_per_worker + int(args.worker_id < remainder)
+    print(
+        f"worker {args.worker_id}/{args.workers_num}: "
+        f"splits {start}:{end} ({end - start} total)"
+    )
+    indices = np.arange(start, end)
 
     if "diverse" in config["env"]:
         # retrieve map metadata for generating custom environments

@@ -103,6 +103,7 @@ class TrainConfig(ConfigBase):
     load_checkpoint_path: Optional[str] = None
     load_l1_only: bool = False
     eval_only: bool = False
+    require_full_checkpoint: bool = False
     train_only: bool = False
     epochs: int = 100
     base_lr: float = 0.2
@@ -368,6 +369,8 @@ class Trainer:
 
     def maybe_load_model(self):
         if self.config.load_checkpoint_path is not None:
+            if self.config.require_full_checkpoint and self.config.load_l1_only:
+                raise ValueError("require_full_checkpoint requires load_l1_only=false")
 
             if os.path.isdir(self.config.load_checkpoint_path):
                 # load the latest checkpoint from the directory
@@ -387,6 +390,8 @@ class Trainer:
             if (
                 "backbone.layer1.0.weight" in state_dict
             ):  # this is jepa only model (legacy)
+                if self.config.require_full_checkpoint:
+                    raise ValueError("Expected a complete HWM checkpoint, got legacy L1 weights")
                 res = self.model.level1.load_state_dict(state_dict)
             else:
                 if self.config.load_l1_only:
@@ -406,6 +411,9 @@ class Trainer:
             assert (
                 len(res.unexpected_keys) == 0
             ), f"Unexpected keys when loading weights: {res.unexpected_keys}"
+            if self.config.require_full_checkpoint and res.missing_keys:
+                raise ValueError(f"Incomplete HWM checkpoint; missing keys: {res.missing_keys}")
+            self.loaded_checkpoint_path = os.path.abspath(load_checkpoint_path)
             print(f"loaded model from {load_checkpoint_path}")
 
             # load ensemble weights if theres any
@@ -661,7 +669,9 @@ class Trainer:
                 epoch=self.epoch,
                 probing_datasets=self.datasets.probing_datasets,
                 l2_probing_datasets=self.datasets.l2_probing_datasets,
-                load_checkpoint_path=self.config.load_checkpoint_path,
+                load_checkpoint_path=getattr(
+                    self, "loaded_checkpoint_path", self.config.load_checkpoint_path
+                ),
                 output_path=self.config.output_path,
             )
 

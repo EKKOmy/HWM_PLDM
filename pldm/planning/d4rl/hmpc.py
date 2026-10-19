@@ -48,12 +48,16 @@ class HierarchicalD4RLMPCEvaluator(MazeMPCEvaluator):
         self.h_planner = self._construct_h_planner(config.n_envs)
 
     def evaluate(self):
-        start_time = time.time()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start_time = time.perf_counter()
 
         data = self._perform_mpc_in_chunks()
 
-        elapsed_time = int(time.time() - start_time)
-        print(f"hierarchical d4rl planning took {format_seconds(elapsed_time)}")
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed_time = time.perf_counter() - start_time
+        print(f"hierarchical d4rl planning took {format_seconds(int(elapsed_time))}")
 
         report = self._construct_report(data, elapsed_time=elapsed_time)
 
@@ -81,7 +85,7 @@ class HierarchicalD4RLMPCEvaluator(MazeMPCEvaluator):
 
         return data, report
 
-    def _construct_report(self, data: PooledMPCResult, elapsed_time: float = 0):
+    def _construct_report(self, data: PooledMPCResult, elapsed_time=None):
         T = len(data.reward_history)
         B = data.reward_history[0].shape[0]
 
@@ -145,6 +149,7 @@ class HierarchicalD4RLMPCEvaluator(MazeMPCEvaluator):
             num_turns=num_turns,
             block_dists=block_dists,
             ood_report=ood_report,
+            elapsed_seconds=elapsed_time,
         )
 
         return report

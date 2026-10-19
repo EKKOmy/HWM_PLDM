@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 import torch
 from pldm.planning.enums import MPCConfig
 from pldm.planning.planners.enums import PlannerConfig
@@ -39,6 +39,7 @@ class MPCReport(NamedTuple):
     num_turns: list
     block_dists: list
     ood_report: dict
+    elapsed_seconds: Optional[float] = None
 
     def build_log_dict(self, prefix=""):
         log_dict = {
@@ -51,9 +52,14 @@ class MPCReport(NamedTuple):
             f"{prefix}_num_one_turns": self.num_one_turns,
             f"{prefix}_num_two_turns": self.num_two_turns,
             f"{prefix}_num_three_turns": self.num_three_turns,
+            f"{prefix}_planning_num_tasks": len(self.success),
+            f"{prefix}_planning_successes": int(torch.as_tensor(self.success).sum().item()),
             # f"{prefix}_block_dist_p": self.block_dist_p,
             # f"{prefix}_num_turns_p": self.num_turns_p,
         }
+
+        if self.elapsed_seconds is not None:
+            log_dict[f"{prefix}_planning_elapsed_seconds"] = self.elapsed_seconds
 
         log_dict.update(self.ood_report)
         return log_dict

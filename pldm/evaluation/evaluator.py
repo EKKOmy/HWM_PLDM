@@ -3,6 +3,14 @@ import torch
 from typing import Optional
 from dataclasses import dataclass
 import dataclasses
+from enum import Enum
+import json
+import math
+from pathlib import Path
+import random
+import zlib
+
+import numpy as np
 
 from pldm.probing.evaluator import ProbingConfig, ProbingEvaluator
 from pldm.data.enums import ProbingDatasets
@@ -29,6 +37,7 @@ class EvalConfig(ConfigBase):
     manispace_planning: MPCConfig = MPCConfig()
     l2_latent_bounds_percentile: float = 0
     l2_use_latent_mean_std: bool = False
+    planning_seed: Optional[int] = None
 
     def __post_init__(self):
         self.d4rl_planning.env_name = self.env_name
@@ -56,6 +65,7 @@ class Evaluator:
         self.normalizer = normalizer
         self.epoch = epoch
         self.output_path = output_path
+        self.load_checkpoint_path = load_checkpoint_path
         self.data_config = data_config  # wall_config
 
         self.probing_evaluator = ProbingEvaluator(
@@ -119,6 +129,95 @@ class Evaluator:
         else:
             raise NotImplementedError
         return config
+
+    def _reset_planning_rng(self, level):
+        """Make each difficulty independent of probe RNG and evaluation order."""
+        if self.config.planning_seed is None:
+            return None
+        offsets = {"easy": 0, "medium": 1009, "hard": 2018}
+        offset = offsets.get(level, zlib.crc32(level.encode("utf-8")))
+        seed = (int(self.config.planning_seed) + offset) % (2**32)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        return seed
+
+    @staticmethod
+    def _json_value(value):
+        if dataclasses.is_dataclass(value):
+            return {
+                field.name: Evaluator._json_value(getattr(value, field.name))
+                for field in dataclasses.fields(value)
+            }
+        if isinstance(value, torch.Tensor):
+            return Evaluator._json_value(value.detach().cpu().tolist())
+        if isinstance(value, (np.ndarray, np.generic)):
+            return Evaluator._json_value(value.tolist())
+        if isinstance(value, Enum):
+            return f"{type(value).__name__}.{value.name}"
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {str(key): Evaluator._json_value(item) for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return [Evaluator._json_value(item) for item in value]
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return value
+
+    def _save_planning_details(self, planning_evaluator, result, report, planning_seed):
+        if self.output_path is None:
+            return
+        successes = self._json_value(report.success)
+        starts = self._json_value(result.locations[0]) if result.locations else None
+        final_positions = self._json_value(result.locations[-1]) if result.locations else None
+        targets = self._json_value(result.targets)
+        trials = getattr(planning_evaluator, "trials", {})
+        tasks = []
+        for index, success in enumerate(successes):
+            tasks.append({
+                "env_index": index,
+                "success": bool(success),
+                "start": starts[index] if starts is not None else None,
+                "target": targets[index],
+                "final_position": final_positions[index] if final_positions is not None else None,
+                "first_success_step_index": report.terminations[index] if success else None,
+                "num_turns": report.num_turns[index],
+                "block_distance": report.block_dists[index],
+                "map_layout": trials.get("map_layouts", [None] * len(successes))[index],
+            })
+        checkpoint_path = (
+            str(Path(self.load_checkpoint_path).expanduser().resolve())
+            if self.load_checkpoint_path else None
+        )
+        details = {
+            "schema_version": 1,
+            "checkpoint_path": checkpoint_path,
+            "epoch": self.epoch,
+            "prefix": planning_evaluator.prefix,
+            "planning_seed": planning_seed,
+            "planning_seed_base": self.config.planning_seed,
+            "config": planning_evaluator.config,
+            "eval_config": self.config,
+            "num_tasks": len(successes),
+            "successes": sum(successes),
+            "success_rate": report.success_rate,
+            "elapsed_seconds": report.elapsed_seconds,
+            "timing_scope": (
+                "synchronized chunk planner construction, planning and environment "
+                "rollout; excluding evaluator construction, probing and final plotting"
+            ),
+            "executed_steps_per_task": len(result.reward_history),
+            "tasks": tasks,
+            "feedback_records": getattr(planning_evaluator, "feedback_records", []),
+        }
+        path = Path(self.output_path) / f"planning_details_{planning_evaluator.prefix}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(self._json_value(details), handle, ensure_ascii=False, indent=2, allow_nan=False)
+        print(f"saved planning details to {path}")
 
     def evaluate_loc_probing(self):
         probers = {}
@@ -291,6 +390,7 @@ class Evaluator:
 
         mpc_config = dataclasses.replace(
             self.h_planning_config,
+            level=level,
             n_envs=n_envs,
             n_steps=n_steps,
             level2=planner_config_l2,
@@ -354,6 +454,7 @@ class Evaluator:
             for i, level in enumerate(levels):
                 level_config = level_configs[i]
 
+                planning_seed = self._reset_planning_rng(level)
                 planning_evaluator = self._create_l1_planning_evaluator(
                     level=level,
                     level_config=level_config,
@@ -365,6 +466,9 @@ class Evaluator:
 
                 mpc_result, mpc_report = planning_evaluator.evaluate()
 
+                self._save_planning_details(
+                    planning_evaluator, mpc_result, mpc_report, planning_seed
+                )
                 planning_evaluator.close()
 
                 log_dict.update(
@@ -386,6 +490,7 @@ class Evaluator:
             for i, level in enumerate(levels):
                 level_config = level_configs[i]
 
+                planning_seed = self._reset_planning_rng(level)
                 planning_evaluator = self._create_l2_planning_evaluator(
                     level=level,
                     level_config=level_config,
@@ -395,6 +500,10 @@ class Evaluator:
                 )
 
                 l2_mpc_result, l2_mpc_report = planning_evaluator.evaluate()
+                self._save_planning_details(
+                    planning_evaluator, l2_mpc_result, l2_mpc_report, planning_seed
+                )
+                planning_evaluator.close()
                 log_dict.update(
                     l2_mpc_report.build_log_dict(prefix=planning_evaluator.prefix)
                 )

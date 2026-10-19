@@ -74,6 +74,7 @@ class MPCEvaluator(ABC):
             l1_planner=l1_planner,
             l2_planner=l2_planner,
             l2_step_skip=self.model.config.step_skip,
+            feedback_config=self.config.subgoal_feedback,
         )
 
         return h_planner
@@ -163,6 +164,7 @@ class MPCEvaluator(ABC):
 
         mpc_data = PooledMPCResult()
         chunk_offset = 0
+        self.feedback_records = []
 
         for chunk_size in chunk_sizes:
             envs = self.envs[chunk_offset : chunk_offset + chunk_size]
@@ -175,6 +177,10 @@ class MPCEvaluator(ABC):
                     planner=planner,
                     envs=envs,
                 )
+                for record in h_planner.feedback_records:
+                    self.feedback_records.append(
+                        dict(record, env_index=record["env_index"] + chunk_offset)
+                    )
             else:
                 mpc_result = self._perform_mpc(
                     planner=planner,

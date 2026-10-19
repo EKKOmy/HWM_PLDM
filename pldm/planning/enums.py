@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from pldm.configs import ConfigBase
 import sys
-from pldm.planning.planners.enums import PlannerConfig
+from pldm.planning.planners.enums import PlannerConfig, SubgoalFeedbackConfig
 from omegaconf import MISSING
 from typing import Optional, NamedTuple, List
 import torch
@@ -57,6 +57,7 @@ class MPCConfig(ConfigBase):
     # below used for hierarchy only:
     mock_l1: bool = False
     level2: PlannerConfig = PlannerConfig()
+    subgoal_feedback: SubgoalFeedbackConfig = field(default_factory=SubgoalFeedbackConfig)
 
 
 class MPCResult(NamedTuple):

@@ -10,6 +10,22 @@ class PlannerType(enum.Enum):
 
 
 @dataclass
+class SubgoalFeedbackConfig(ConfigBase):
+    # Opt-in inference-only experiment. Candidate 0 is the unchanged MPPI plan.
+    enabled: bool = False
+    num_candidates: int = 3
+    weight: float = 1.0
+
+    def __post_init__(self):
+        import math
+
+        if self.num_candidates < 1:
+            raise ValueError("feedback.num_candidates must be >= 1")
+        if not math.isfinite(self.weight) or self.weight < 0:
+            raise ValueError("feedback.weight must be finite and >= 0")
+
+
+@dataclass
 class SGDConfig(ConfigBase):
     n_iters: int = 100
     lr: float = 1e-2

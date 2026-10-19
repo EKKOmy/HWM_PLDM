@@ -300,6 +300,7 @@ class MPPIPlanner:
         self.action_normalizer = action_normalizer
         self.prober = prober
         self.latent_actions = latent_actions
+        self.cost_entity = cost_entity
         self.use_latent_mean_std = use_latent_mean_std
 
         action_dim = model.predictor.action_dim
@@ -460,6 +461,18 @@ class MPPIPlanner:
 
         actions = torch.stack(actions)
 
+        result = self._rollout_actions(backbone_output, actions)
+        self.dynamics.after_planning_callback()
+        self.last_plan_size = plan_size
+        return result
+
+    def _rollout_actions(self, backbone_output, actions):
+        """Roll out normalized controller actions; do not change the warm start."""
+        current_state = backbone_output.encodings.detach()
+        proprio = backbone_output.proprio_component
+        location = backbone_output.location_component
+        raw_location = backbone_output.raw_locations
+
         ensemble_state_input = self.dynamics.model.predictor._prepare_ensemble_input(
             current_state
         )
@@ -497,9 +510,6 @@ class MPPIPlanner:
         else:
             actions = self.normalizer.unnormalize_action(actions)
 
-        self.dynamics.after_planning_callback()
-        self.last_plan_size = plan_size
-
         losses = [0]
 
         if pred_raw_locations is not None:
@@ -528,6 +538,62 @@ class MPPIPlanner:
             locations=unnormed_locations,
             losses=losses,
         )
+
+    @torch.no_grad()
+    def rollout_actions(self, backbone_output, actions):
+        """Evaluate an existing action sequence without another MPPI search."""
+        self.dynamics.before_planning_callback()
+        try:
+            return self._rollout_actions(backbone_output, actions)
+        finally:
+            self.dynamics.after_planning_callback()
+
+    def candidate_actions(self, count, batch_size):
+        """Nominal first, then best samples from the *existing* MPPI call.
+
+        MPPI cost_total includes a perturbation cost: it is used for shortlisting
+        only. The feedback planner rescores every candidate with the same pure
+        goal objective, including the nominal sequence.
+        """
+        if count > min(ctrl.K for ctrl in self.ctrls[:batch_size]) + 1:
+            raise ValueError("feedback candidates cannot exceed MPPI samples + 1")
+        per_env = []
+        for ctrl in self.ctrls[:batch_size]:
+            candidates = [ctrl.U.detach().clone()]
+            if count > 1:
+                valid = torch.isfinite(ctrl.cost_total) & torch.isfinite(
+                    ctrl.perturbed_action
+                ).flatten(1).all(1)
+                costs = ctrl.cost_total.masked_fill(~valid, float("inf"))
+                for idx in costs.argsort()[: count - 1]:
+                    # A missing finite sample falls back to the nominal candidate.
+                    action = ctrl.perturbed_action[idx] if valid[idx] else ctrl.U
+                    candidates.append(action.detach().clone())
+            per_env.append(torch.stack(candidates))
+        return torch.stack(per_env, dim=1)  # C, B, T, A (normalized)
+
+    @torch.no_grad()
+    def score_plan(self, result, terminal_only=False):
+        """Per-environment observation cost in the planner's own target space.
+
+        Average (not sum) over the same scored future steps as MPPI so the
+        feedback coefficient is independent of the shrinking L2 horizon.
+        This experiment deliberately supports only single-model obs costs.
+        """
+        if self.cost_entity != "obs_component" or self.model.predictor.ensemble_size != 1:
+            raise ValueError("Subgoal feedback requires obs_component and ensemble_size=1")
+        values = []
+        for b in range(result.actions.shape[0]):
+            cost = self.mppi_costs[b]
+            states = result.pred_obs[1:, b]
+            if terminal_only:
+                states = states[-1:]
+            elif not cost.sum_all_diffs and cost.sum_last_n is not None:
+                states = states[-cost.sum_last_n:] if cost.sum_last_n > 0 else states[:0]
+            if not len(states):
+                raise ValueError("Feedback scoring requires at least one scored step")
+            values.append(cost(states, None).mean())
+        return torch.stack(values)
 
     def reset_targets(self, targets: torch.Tensor, repr_input: bool = True):
         self.objective.set_target(targets, repr_input=repr_input)

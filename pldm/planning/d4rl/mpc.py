@@ -1,4 +1,5 @@
 from typing import Optional
+import time
 
 import torch
 
@@ -64,7 +65,7 @@ class MazeMPCEvaluator(MPCEvaluator):
             unique_shortest_path=config.unique_shortest_path,
             normalizer=self.normalizer,
         )
-        self.envs, _ = envs_generator()
+        self.envs, self.trials = envs_generator()
 
         self.prober_l2 = prober_l2
         self.fix_start = fix_start
@@ -100,7 +101,7 @@ class MazeMPCEvaluator(MPCEvaluator):
 
         return ood_report
 
-    def _construct_report(self, data: PooledMPCResult):
+    def _construct_report(self, data: PooledMPCResult, elapsed_time=None):
         # Determine termination indices
         T = len(data.reward_history)
         B = data.reward_history[0].shape[0]
@@ -166,14 +167,21 @@ class MazeMPCEvaluator(MPCEvaluator):
             num_turns=num_turns,
             block_dists=block_dists,
             ood_report=ood_report,
+            elapsed_seconds=elapsed_time,
         )
 
         return report
 
     def evaluate(self):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start_time = time.perf_counter()
         mpc_data = self._perform_mpc_in_chunks()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed_time = time.perf_counter() - start_time
 
-        report = self._construct_report(mpc_data)
+        report = self._construct_report(mpc_data, elapsed_time=elapsed_time)
 
         log_l1_planning_loss(result=mpc_data, prefix=self.prefix)
 

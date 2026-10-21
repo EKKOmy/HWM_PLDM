@@ -32,13 +32,26 @@ def resolve_checkpoint(path):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("baseline", "feedback", "candidates"))
+    parser.add_argument(
+        "mode", choices=("baseline", "feedback", "candidates", "candidates_safe", "feedback_safe")
+    )
     parser.add_argument("--checkpoint", required=True, help="Your trained HWM file or run directory")
     parser.add_argument("--gpu", default="2", help="Physical GPU ID; one GPU per evaluation")
     parser.add_argument("--seed", type=int, default=246)
     parser.add_argument("--planning-seed", type=int, default=246)
     parser.add_argument("--num-candidates", type=int, default=3)
     parser.add_argument("--weight", type=float, default=1.0)
+    parser.add_argument("--score-atol", type=float, default=1e-5,
+                        help="Safe modes: absolute minimum score improvement")
+    parser.add_argument("--score-rtol", type=float, default=1e-4,
+                        help="Safe modes: relative minimum score improvement")
+    parser.add_argument("--reach-trigger", type=float, default=0.1,
+                        help="feedback_safe: intervene only above this nominal predicted reach cost; uncalibrated default")
+    parser.add_argument("--reach-improvement-atol", type=float, default=1e-5)
+    parser.add_argument("--reach-improvement-rtol", type=float, default=0.1)
+    parser.add_argument("--goal-degradation-atol", type=float, default=1e-6)
+    parser.add_argument("--goal-degradation-rtol", type=float, default=0.0,
+                        help="feedback_safe: permitted relative goal-cost increase (default none)")
     parser.add_argument("--workers", type=int, default=0, help="Data loader workers (0 avoids I/O fan-out)")
     parser.add_argument("--output-root", type=Path, default=PROJECT / "checkpoint/maze2d_large_diverse/feedback_experiment")
     parser.add_argument("--run-name", help="New directory name; existing directories are rejected")
@@ -51,6 +64,13 @@ def main(argv=None):
             raise ValueError("num-candidates >= 1 and workers >= 0 required")
         if not math.isfinite(args.weight) or args.weight < 0:
             raise ValueError("weight must be finite and non-negative")
+        for name in ("score_atol", "score_rtol", "reach_trigger", "reach_improvement_atol",
+                     "reach_improvement_rtol", "goal_degradation_atol", "goal_degradation_rtol"):
+            value = getattr(args, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"{name.replace('_', '-')} must be finite and non-negative")
+        if args.reach_improvement_rtol >= 1:
+            raise ValueError("reach-improvement-rtol must be < 1")
         if not 0 <= args.seed < 2**32 or not 0 <= args.planning_seed < 2**32:
             raise ValueError("seeds must be in [0, 2**32)")
         if not re.fullmatch(r"\d+", args.gpu):
@@ -70,7 +90,10 @@ def main(argv=None):
         parser.error(str(exc))
 
     feedback = args.mode != "baseline"
-    weight = 0.0 if args.mode == "candidates" else args.weight
+    weight = 0.0 if args.mode in ("candidates", "candidates_safe") else args.weight
+    selection_mode = {
+        "candidates_safe": "tolerance", "feedback_safe": "conservative",
+    }.get(args.mode, "legacy")
     # Quote string override values for OmegaConf, including checkpoint filenames
     # containing '='. subprocess receives an argument list, never shell text.
     import json
@@ -88,7 +111,11 @@ def main(argv=None):
         f"eval_cfg.h_d4rl_planning.subgoal_feedback.enabled={str(feedback).lower()}",
         f"eval_cfg.h_d4rl_planning.subgoal_feedback.num_candidates={args.num_candidates}",
         f"eval_cfg.h_d4rl_planning.subgoal_feedback.weight={weight}",
+        f"eval_cfg.h_d4rl_planning.subgoal_feedback.selection_mode={selection_mode}",
     ]
+    for name in ("score_atol", "score_rtol", "reach_trigger", "reach_improvement_atol",
+                 "reach_improvement_rtol", "goal_degradation_atol", "goal_degradation_rtol"):
+        values.append(f"eval_cfg.h_d4rl_planning.subgoal_feedback.{name}={getattr(args, name)}")
     if args.smoke:
         values += [
             "eval_cfg.probing.epochs=1", "eval_cfg.probing.epochs_enc=1",
@@ -109,6 +136,12 @@ def main(argv=None):
     ]
     print(f"Checkpoint: {checkpoint}\nOutput: {output_root / run_name}", flush=True)
     print(f"CUDA_VISIBLE_DEVICES={args.gpu} " + shlex.join(command), flush=True)
+    if selection_mode == "conservative":
+        print(
+            "Conservative gates use predicted errors, not true executability. "
+            "Thresholds are uncalibrated defaults; use validation tasks to choose them.",
+            flush=True,
+        )
     if args.smoke:
         print("SMOKE CHECK ONLY: do not compare these rates with the 40-task experiment.", flush=True)
     if args.dry_run:

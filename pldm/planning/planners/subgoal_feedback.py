@@ -43,6 +43,81 @@ def restore(planner, saved):
     planner.objective.target_enc = target
 
 
+def choose_candidates(goals, reaches, scores, valid, config):
+    """Choose independently per environment; candidate zero is the nominal plan.
+
+    Tolerance requires a meaningful score gain over zero. Conservative selection
+    additionally requires a high nominal reach error, a bounded goal-cost loss,
+    and a meaningful reach-error reduction. These are model-score guards, not
+    guarantees of better control. Invalid nominal plans fall back to finite
+    candidates rather than being protected by the guards.
+    """
+    mode = getattr(config, "selection_mode", "legacy")
+    if mode not in ("legacy", "tolerance", "conservative"):
+        raise ValueError(f"Unknown feedback selection mode: {mode}")
+    valid = valid & torch.isfinite(goals) & torch.isfinite(reaches) & torch.isfinite(scores)
+    if not valid.any(dim=0).all():
+        raise RuntimeError("No finite subgoal candidate for at least one environment")
+    raw_best = scores.masked_fill(~valid, float("inf")).argmin(dim=0)
+    nominal_valid = valid[0]
+    eligible = valid.clone()
+    score_pass = torch.ones_like(valid)
+    goal_pass = torch.ones_like(valid)
+    reach_pass = torch.ones_like(valid)
+    triggered = torch.ones_like(nominal_valid)
+    score_tolerance = torch.zeros_like(scores[0])
+
+    if mode != "legacy":
+        score_tolerance = config.score_atol + config.score_rtol * scores[0].abs()
+        score_pass = scores[0].unsqueeze(0) - scores > score_tolerance.unsqueeze(0)
+        eligible &= score_pass
+        if mode == "conservative":
+            triggered = reaches[0] > config.reach_trigger
+            goal_limit = config.goal_degradation_atol + config.goal_degradation_rtol * goals[0].abs()
+            reach_gain = config.reach_improvement_atol + config.reach_improvement_rtol * reaches[0].abs()
+            goal_pass = goals - goals[0].unsqueeze(0) <= goal_limit.unsqueeze(0)
+            reach_pass = reaches[0].unsqueeze(0) - reaches > reach_gain.unsqueeze(0)
+            eligible &= triggered.unsqueeze(0) & goal_pass & reach_pass
+        eligible[0] = nominal_valid
+        # Avoid NaN thresholds stranding an environment whose original plan failed.
+        eligible = torch.where(nominal_valid.unsqueeze(0), eligible, valid)
+
+    selected = scores.masked_fill(~eligible, float("inf")).argmin(dim=0)
+    return selected, {
+        "raw_best": raw_best,
+        "nominal_valid": nominal_valid,
+        "eligible": eligible,
+        "score_pass": score_pass,
+        "goal_pass": goal_pass,
+        "reach_pass": reach_pass,
+        "triggered": triggered,
+        "score_tolerance": score_tolerance,
+    }
+
+
+def candidate_differences(l1_results, l2_results, actions):
+    """Diagnostic distances, never used for ranking; no simulator input needed."""
+    def rms(delta):
+        return delta.flatten(1).square().mean(1).sqrt()
+
+    return {
+        "subgoal_rms_from_nominal": torch.stack([
+            rms(result.pred_obs[1] - l2_results[0].pred_obs[1])
+            for result in l2_results
+        ]),
+        "l2_action_rms_from_nominal": torch.stack([
+            rms(action - actions[0]) for action in actions
+        ]),
+        "l1_action_rms_from_nominal": torch.stack([
+            rms(result.actions - l1_results[0].actions) for result in l1_results
+        ]),
+        "l1_first_action_l2_from_nominal": torch.stack([
+            (result.actions[:, 0] - l1_results[0].actions[:, 0]).norm(dim=-1)
+            for result in l1_results
+        ]),
+    }
+
+
 @torch.no_grad()
 def plan_with_feedback(l1, l2, backbone, nominal, step_skip, config, **plan_kwargs):
     """Keep the original high-level search, inspect C low-level plans.
@@ -94,9 +169,7 @@ def plan_with_feedback(l1, l2, backbone, nominal, step_skip, config, **plan_kwar
         valid = torch.isfinite(goals) & torch.isfinite(reaches) & torch.isfinite(scores)
         for c, result in enumerate(l1_results):
             valid[c] &= torch.isfinite(result.actions).flatten(1).all(1)
-        if not valid.any(dim=0).all():
-            raise RuntimeError("No finite subgoal candidate for at least one environment")
-        selected = scores.masked_fill(~valid, float("inf")).argmin(dim=0)
+        selected, selection_info = choose_candidates(goals, reaches, scores, valid, config)
         low = select_results(l1_results, selected)
         high = select_results(l2_results, selected)
 
@@ -112,14 +185,35 @@ def plan_with_feedback(l1, l2, backbone, nominal, step_skip, config, **plan_kwar
         raise
 
     goals, reaches, scores = [x.detach().cpu() for x in (goals, reaches, scores)]
+    selection_info = {key: value.detach().cpu() for key, value in selection_info.items()}
+    differences = {
+        key: value.detach().cpu()
+        for key, value in candidate_differences(l1_results, l2_results, candidates).items()
+    }
+    mode = getattr(config, "selection_mode", "legacy")
 
     def finite_list(values):
         return [float(x) if torch.isfinite(x) else None for x in values]
 
     records = [
         {
+            "record_version": 2,
             "env_index": b,
             "selected_candidate": c,
+            "raw_best_candidate": int(selection_info["raw_best"][b]),
+            "selection_mode": mode,
+            "selection_reason": (
+                "invalid_nominal_fallback" if not selection_info["nominal_valid"][b]
+                else "legacy_minimum" if mode == "legacy"
+                else "accepted_alternative" if c != 0
+                else "nominal_retained"
+            ),
+            "reach_gate_triggered": bool(selection_info["triggered"][b]),
+            "score_tolerance": finite_list(selection_info["score_tolerance"][b:b + 1])[0],
+            "eligible_candidates": selection_info["eligible"][:, b].tolist(),
+            "score_margin_passed": selection_info["score_pass"][:, b].tolist(),
+            "goal_guard_passed": selection_info["goal_pass"][:, b].tolist(),
+            "reach_guard_passed": selection_info["reach_pass"][:, b].tolist(),
             "goal_costs": finite_list(goals[:, b]),
             "reach_costs": finite_list(reaches[:, b]),
             "scores": finite_list(scores[:, b]),
@@ -128,6 +222,7 @@ def plan_with_feedback(l1, l2, backbone, nominal, step_skip, config, **plan_kwar
             "l2_samples": l2.ctrls[b].K,
             "l1_horizon": step_skip,
             "l2_horizon": l2.ctrls[b].T,
+            **{key: finite_list(value[:, b]) for key, value in differences.items()},
         }
         for b, c in enumerate(selected.tolist())
     ]

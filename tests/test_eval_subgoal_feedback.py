@@ -49,7 +49,7 @@ class LauncherTest(unittest.TestCase):
         self.assertFalse(self.output.exists())
 
     def test_modes_keep_the_same_checkpoint_seed_and_protect_complete_weights(self):
-        for mode in ("baseline", "feedback", "candidates"):
+        for mode in ("baseline", "feedback", "candidates", "candidates_safe", "feedback_safe"):
             with mock.patch.object(launcher.subprocess, "call", return_value=0) as call:
                 self.assertEqual(self.invoke(mode), 0)
                 command = call.call_args.args[0]
@@ -61,7 +61,11 @@ class LauncherTest(unittest.TestCase):
                 self.assertEqual(json.loads(values["load_checkpoint_path"]), str(self.checkpoint.resolve()))
                 prefix = "eval_cfg.h_d4rl_planning.subgoal_feedback."
                 self.assertEqual(values[prefix + "enabled"], str(mode != "baseline").lower())
-                self.assertEqual(float(values[prefix + "weight"]), 0 if mode == "candidates" else 1)
+                self.assertEqual(float(values[prefix + "weight"]), 0 if mode.startswith("candidates") else 1)
+                self.assertEqual(values[prefix + "selection_mode"], {
+                    "candidates_safe": "tolerance", "feedback_safe": "conservative",
+                }.get(mode, "legacy"))
+                self.assertEqual(values["output_dir"], f"{mode}_seed246_p246")
                 self.assertEqual(call.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], "2")
 
     def test_smoke_has_separate_output_and_tiny_evaluation(self):
@@ -87,9 +91,21 @@ class LauncherTest(unittest.TestCase):
             ("--num-candidates", "0"), ("--workers", "-1"),
             ("--seed", "-1"), ("--gpu", "2,3"),
             ("--run-name", "../oops"), ("--run-name", "test"),
+            ("--score-atol", "-1"), ("--score-rtol", "nan"),
+            ("--reach-trigger", "inf"), ("--reach-improvement-rtol", "1"),
+            ("--goal-degradation-rtol", "-1"),
         ):
             with self.subTest(args=args), self.assertRaises(SystemExit):
                 self.invoke("feedback", *args)
+
+    def test_safe_threshold_overrides_are_forwarded(self):
+        with mock.patch.object(launcher.subprocess, "call", return_value=0) as call:
+            self.invoke("feedback_safe", "--reach-trigger", "0.25", "--score-atol", "0.0002")
+            command = call.call_args.args[0]
+            prefix = "eval_cfg.h_d4rl_planning.subgoal_feedback."
+            self.assertIn(prefix + "reach_trigger=0.25", command)
+            self.assertIn(prefix + "score_atol=0.0002", command)
+            self.assertIn(prefix + "goal_degradation_rtol=0.0", command)
 
     def test_missing_checkpoint_and_empty_directory_fail(self):
         with self.assertRaises(ValueError):

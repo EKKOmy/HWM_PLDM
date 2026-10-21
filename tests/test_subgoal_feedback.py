@@ -35,6 +35,8 @@ with _imports:
     from pldm.planning.objectives_v2 import ReprTargetMPCObjective, ReprTargetMPCObjective2
     from pldm.planning.planners.subgoal_feedback import (
         plan_with_feedback,
+        choose_candidates,
+        candidate_differences,
         select_results,
         snapshot,
     )
@@ -301,6 +303,110 @@ class FeedbackTest(unittest.TestCase):
         self.assert_snapshot_equal(high, before_high)
 
 
+class GuardedSelectionTest(unittest.TestCase):
+    def choose(self, goals, reaches, mode="conservative", valid=None, **kwargs):
+        goals = torch.tensor(goals, dtype=torch.float64)
+        reaches = torch.tensor(reaches, dtype=torch.float64)
+        config = SubgoalFeedbackConfig(selection_mode=mode, **kwargs)
+        scores = goals + config.weight * reaches
+        if valid is None:
+            valid = torch.ones_like(scores, dtype=torch.bool)
+        return choose_candidates(goals, reaches, scores, valid, config)
+
+    def test_tolerance_keeps_original_on_float32_scale_gain(self):
+        selected, info = self.choose(
+            [[1., 100.], [1. - 1.192092896e-7, 99.999]],
+            [[0., 0.], [0., 0.]], mode="tolerance", weight=0,
+        )
+        self.assertEqual(selected.tolist(), [0, 0])
+        self.assertEqual(info["raw_best"].tolist(), [1, 1])
+
+    def test_tolerance_accepts_clear_gain_per_environment(self):
+        selected, _ = self.choose(
+            [[1., 100.], [.99, 99.999], [.99999999, 98.]],
+            [[0., 0.], [0., 0.], [0., 0.]], mode="tolerance", weight=0,
+        )
+        self.assertEqual(selected.tolist(), [1, 2])
+
+    def test_equal_score_margin_does_not_replace_nominal(self):
+        selected, _ = self.choose(
+            [[1.], [.875]], [[0.], [0.]], mode="tolerance", weight=0,
+            score_atol=.125, score_rtol=0,
+        )
+        self.assertEqual(selected.item(), 0)
+
+    def test_conservative_requires_high_nominal_error(self):
+        selected, info = self.choose([[1., 1.], [.5, .5]], [[.05, .1], [0., 0.]])
+        self.assertEqual(selected.tolist(), [0, 0])
+        self.assertEqual(info["triggered"].tolist(), [False, False])
+
+    def test_conservative_filters_goal_harm_before_ranking(self):
+        selected, info = self.choose([[1.], [1.1], [1.]], [[.5], [0.], [.25]])
+        self.assertEqual(info["raw_best"].item(), 1)
+        self.assertEqual(selected.item(), 2)
+        self.assertFalse(info["goal_pass"][1, 0])
+        self.assertTrue(info["eligible"][2, 0])
+
+    def test_conservative_rejects_small_reach_improvement_despite_goal_gain(self):
+        selected, info = self.choose([[1.], [.5]], [[.2], [.19]])
+        self.assertEqual(selected.item(), 0)
+        self.assertFalse(info["reach_pass"][1, 0])
+
+    def test_goal_degradation_allowance_is_explicit_and_relative(self):
+        selected, _ = self.choose([[2.], [2.05]], [[.5], [.1]])
+        self.assertEqual(selected.item(), 0)
+        selected, _ = self.choose(
+            [[2.], [2.05]], [[.5], [.1]], goal_degradation_rtol=.03,
+        )
+        self.assertEqual(selected.item(), 1)
+
+    def test_conservative_preserves_nominal_if_no_alternative_passes(self):
+        selected, info = self.choose([[1.], [1.2]], [[.5], [0.]])
+        self.assertEqual(selected.item(), 0)
+        self.assertEqual(info["eligible"][:, 0].tolist(), [True, False])
+
+    def test_invalid_nominal_falls_back_even_when_gates_would_block(self):
+        for mode in ("legacy", "tolerance", "conservative"):
+            with self.subTest(mode=mode):
+                selected, info = self.choose(
+                    [[float("nan"), 1.], [10., .9]], [[.01, .01], [5., 5.]],
+                    mode=mode, valid=torch.tensor([[True, False], [True, True]]),
+                )
+                self.assertEqual(selected.tolist(), [1, 1])
+                self.assertEqual(info["nominal_valid"].tolist(), [False, False])
+
+    def test_all_invalid_fails_in_every_mode(self):
+        for mode in ("legacy", "tolerance", "conservative"):
+            with self.subTest(mode=mode), self.assertRaisesRegex(RuntimeError, "No finite"):
+                self.choose([[float("nan")], [float("inf")]], [[1.], [2.]], mode=mode)
+
+    def test_config_rejects_bad_modes_and_nonfinite_or_negative_thresholds(self):
+        for changes in (
+            {"selection_mode": "typo"}, {"score_atol": -1}, {"score_rtol": float("nan")},
+            {"reach_trigger": float("inf")}, {"goal_degradation_rtol": -1},
+            {"reach_improvement_rtol": 1}, {"reach_improvement_atol": -1},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                SubgoalFeedbackConfig(**changes)
+
+    def test_diagnostics_measure_actual_tensor_differences(self):
+        nominal = make_result(0, batch=2)
+        alternate = nominal._replace(
+            pred_obs=nominal.pred_obs + 3,
+            actions=nominal.actions + torch.tensor([3., 4.]),
+        )
+        normalized = torch.stack([torch.zeros(2, 3, 2), torch.full((2, 3, 2), 2.)])
+        values = candidate_differences([nominal, alternate], [nominal, alternate], normalized)
+        expected = {
+            "subgoal_rms_from_nominal": 3., "l2_action_rms_from_nominal": 2.,
+            "l1_action_rms_from_nominal": math.sqrt(12.5),
+            "l1_first_action_l2_from_nominal": 5.,
+        }
+        for key, value in expected.items():
+            torch.testing.assert_close(values[key][0], torch.zeros(2))
+            torch.testing.assert_close(values[key][1], torch.full((2,), value))
+
+
 class MPPIInterfaceTest(unittest.TestCase):
     def scoring_planner(self, target, sum_all_diffs=False, sum_last_n=2):
         planner = MPPIPlanner.__new__(MPPIPlanner)
@@ -437,7 +543,7 @@ class ToyModel(torch.nn.Module):
 
 
 class ToyIntegrationTest(unittest.TestCase):
-    def make_planner(self, enabled, candidates=1):
+    def make_planner(self, enabled, candidates=1, selection_mode="legacy", **kwargs):
         low_model, high_model = ToyModel(), ToyModel(l2=True)
         low_model.eval()
         high_model.eval()
@@ -452,13 +558,15 @@ class ToyIntegrationTest(unittest.TestCase):
             ReprTargetMPCObjective2(model=high_model, sum_all_diffs=True),
             n_envs=2, l2=True,
         )
-        planner = TwoLvlPlanner(low, high, 2, SubgoalFeedbackConfig(enabled, candidates, 1.0))
+        planner = TwoLvlPlanner(low, high, 2, SubgoalFeedbackConfig(
+            enabled, candidates, 1.0, selection_mode=selection_mode, **kwargs
+        ))
         planner.reset_targets(torch.tensor([[2., 1.], [1., -2.]]))
         return planner
 
-    def run_sequence(self, enabled, candidates=1):
+    def run_sequence(self, enabled, candidates=1, selection_mode="legacy", **kwargs):
         torch.manual_seed(781)
-        planner = self.make_planner(enabled, candidates)
+        planner = self.make_planner(enabled, candidates, selection_mode, **kwargs)
         results = []
         for horizon in (4, 3):
             result = planner.plan(torch.zeros(2, 2), plan_size=horizon)
@@ -497,6 +605,31 @@ class ToyIntegrationTest(unittest.TestCase):
             self.assertTrue(torch.isfinite(result.level2.pred_obs).all())
         self.assertEqual(len(planner.feedback_records), 4)
         self.assertTrue(all(len(r["scores"]) == 3 for r in planner.feedback_records))
+
+    def test_guarded_three_candidate_modes_keep_nominal_state_when_all_changes_blocked(self):
+        baseline, baseline_planner, baseline_rng = self.run_sequence(False)
+        for mode, kwargs in (
+            ("tolerance", {"score_atol": 1e9}),
+            ("conservative", {"reach_trigger": 1e9}),
+        ):
+            results, planner, rng = self.run_sequence(True, 3, mode, **kwargs)
+            torch.testing.assert_close(baseline_rng, rng)
+            for left, right in zip(baseline, results):
+                for lhs, rhs in zip(left, right):
+                    for name in PlanningResult._fields:
+                        expected, actual = getattr(lhs, name), getattr(rhs, name)
+                        if isinstance(expected, torch.Tensor):
+                            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                        else:
+                            self.assertEqual(actual, expected)
+            for level in ("l1_planner", "l2_planner"):
+                for lhs, rhs in zip(getattr(planner, level).ctrls, getattr(baseline_planner, level).ctrls):
+                    torch.testing.assert_close(lhs.U, rhs.U, rtol=0, atol=0)
+            for record in planner.feedback_records:
+                self.assertEqual(record["selected_candidate"], 0)
+                self.assertEqual(record["selection_reason"], "nominal_retained")
+                self.assertEqual(record["record_version"], 2)
+                self.assertEqual(record["subgoal_rms_from_nominal"][0], 0)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,117 @@
 也没有新增可达性网络。误差由冻结的低层模型估计，不是真实可达性的保证。
 只支持当前 MPPI、latent L2 action、obs_component、单模型 ensemble 的配置。
 
-## 方法
+## 第二轮：近似平局保护与保守反馈
+
+第一轮 feedback 在 medium 上比同期 baseline 高 5 个百分点，但在 hard 上低
+7.5 个百分点；不能认为方法已经有效。上传日志还显示，很多 candidates 的非零候选
+选择只有很小的 G 改善，而 feedback 会接受 G 变差、R 变好的候选。
+这只是修改动机，不证明它们导致了失败；旧日志没有候选张量距离，候选编号变化也
+不一定代表实际路径变化。
+
+新增两个显式选择的模式，旧 baseline / candidates / feedback 的选择规则保持不变：
+
+| 新模式 | 相比旧模式的改动 | 对照目的 |
+|---|---|---|
+| candidates_safe | λ=0；G 的改善超过绝对、相对容差才替换 nominal | 与 candidates 对比，单独检验平局保护 |
+| feedback_safe | 平局保护 + 原方案误差触发 + 目标代价约束 + 执行误差改善约束 | 与 feedback 对比，检验整套保守反馈规则 |
+
+令候选 0 为原方案，S = G + λR。candidates_safe 接受非零候选的条件为：
+
+```text
+S0 - Sc > score_atol + score_rtol * abs(S0)
+```
+
+feedback_safe 还要求下面三个条件同时满足，再在合格候选与原方案中选 S 最小者：
+
+```text
+R0 > reach_trigger
+Gc - G0 <= goal_degradation_atol + goal_degradation_rtol * abs(G0)
+R0 - Rc > reach_improvement_atol + reach_improvement_rtol * abs(R0)
+```
+
+默认 score_atol=1e-5、score_rtol=1e-4、reach_trigger=0.1、
+reach_improvement_atol=1e-5、reach_improvement_rtol=0.1、
+goal_degradation_atol=1e-6、goal_degradation_rtol=0。
+没有候选满足约束时保留原方案；原方案非有限时，回退到有限候选中 S 最小者，
+没有任何有效候选则报错。这里的 safe 仅指这些模型评分保护，不保证真实执行安全或成功率。
+
+所有阈值都是**未校准的初始设置**，不是论文结果或最优参数。R 是潜空间的模型成本，
+0.1 不是米、概率或实测距离；不同模型的量级可能不同。可通过同名命令行参数覆盖
+（下划线改为连字符，如 --reach-trigger）。所有参数会随评估配置写入详情文件。
+本轮每个模式仍执行 C 次低层搜索，门控只改变选择，不节省候选搜索开销。
+
+### 第二轮服务器命令
+
+先同步本次代码到服务器。无需重新生成数据或训练世界模型；评估仍会拟合位置探针。
+固定为第一轮详情文件记录的 checkpoint，避免目录自动选择到其他权重：
+
+```bash
+cd /home/my/HWM_PLDM
+HWM_CHECKPOINT=/home/my/HWM_PLDM/checkpoint/maze2d_large_diverse/l2_wo_encoder/hwm_l2_seed246/epoch=5_sample_step=10789632.ckpt
+
+# 两种模式各做一次小规模接线检查；失败就停止循环。
+for experiment_mode in candidates_safe feedback_safe; do
+  /home/my/miniconda3/envs/hwm/bin/python scripts/eval_subgoal_feedback.py "$experiment_mode" \
+    --checkpoint "$HWM_CHECKPOINT" --gpu 2 --seed 246 --planning-seed 246 --smoke || break
+done
+```
+
+确认两次 smoke 都正常退出后，先跑 candidates_safe，检查单独加入容差的影响：
+
+```bash
+/home/my/miniconda3/envs/hwm/bin/python scripts/eval_subgoal_feedback.py candidates_safe \
+  --checkpoint "$HWM_CHECKPOINT" --gpu 2 --seed 246 --planning-seed 246
+```
+
+再在同一张卡空闲时评估 feedback_safe：
+
+```bash
+/home/my/miniconda3/envs/hwm/bin/python scripts/eval_subgoal_feedback.py feedback_safe \
+  --checkpoint "$HWM_CHECKPOINT" --gpu 2 --seed 246 --planning-seed 246
+```
+
+正式模式默认仍是 medium/hard 各 40 个任务，可能各耗时数小时。
+新输出目录为 candidates_safe_seed246_p246 与 feedback_safe_seed246_p246，
+不会覆盖第一轮目录；smoke 另加 _smoke 后缀。不要删除旧结果，也不必为了这次对比
+重新运行已有 baseline。需要重复运行时指定新的 --run-name。
+
+两组正式运行完成后比较（--historical 不是本轮的配对基线，故这里不加）：
+
+```bash
+/home/my/miniconda3/envs/hwm/bin/python scripts/compare_planning_runs.py \
+  --run baseline=checkpoint/maze2d_large_diverse/feedback_experiment/baseline_seed246_p246/summary.json \
+  --run candidates=checkpoint/maze2d_large_diverse/feedback_experiment/candidates_seed246_p246/summary.json \
+  --run candidates_safe=checkpoint/maze2d_large_diverse/feedback_experiment/candidates_safe_seed246_p246/summary.json \
+  --run feedback=checkpoint/maze2d_large_diverse/feedback_experiment/feedback_seed246_p246/summary.json \
+  --run feedback_safe=checkpoint/maze2d_large_diverse/feedback_experiment/feedback_safe_seed246_p246/summary.json
+```
+
+比较脚本的百分点差默认相对第一个 --run；若要直接看平局保护的差值，将 candidates
+放在第一个 --run。它只汇总结果，不自动验证任务配对，仍需核对详情中的 checkpoint、
+起终点、环境/规划种子和预算。feedback_safe 同时增加多个约束，不是单一 λ 的消融。
+这 40 个任务已经用于发现问题，应作为开发对比；论文最终结果需使用未用于改方法或
+选阈值的任务，并增加规划种子及独立训练种子。现有旧轨迹不能离线推算新策略的成功率。
+
+### 第二轮新增诊断
+
+新生成的 feedback_records 带 record_version=2，保留全部旧字段并新增：
+
+- raw_best_candidate、selected_candidate、selection_reason：未加保护的最优候选、
+  实际选择及保留/替换/无效原方案回退原因。
+- eligible_candidates、score_margin_passed、goal_guard_passed、reach_guard_passed、
+  reach_gate_triggered、score_tolerance：逐候选门控结果与实际评分容差。
+  未启用的门控记为 true，不表示经过了检验；原方案可被保留而不满足改善条件，
+  无效原方案回退则显式绕过门控。
+- subgoal_rms_from_nominal：相对候选 0 的原始预测子目标潜表示 RMS 差。
+- l2_action_rms_from_nominal：高层归一化动作序列 RMS 差。
+- l1_action_rms_from_nominal：低层物理动作序列 RMS 差。
+- l1_first_action_l2_from_nominal：低层首个物理动作差的 L2 范数。
+
+这些距离仅用于诊断，不参与选择，也不是实际环境轨迹距离。应重点统计任务首次成功
+之前的规划记录，避免到达目标后的行为干扰解释；记录中的 planning_call 是从 0 开始的。
+
+## 第一轮方法（保留）
 
 每次原有 L2 MPPI 搜索完成后，保留原 nominal 序列，以及该次搜索中
 代价最低的 C−1 条已采样序列。默认 C=3。不额外进行 L2 随机搜索。
@@ -131,7 +241,8 @@ planning seed，因此重新评估的 baseline 不保证恰好等于历史数值
 计时包含分块规划器构建、模型规划、环境执行和记录，不含之前的探针训练与之后的绘图；
 它不是纯 GPU kernel 时间。各模式计时范围相同，额外候选 rollout/check 开销也包含在内。
 feedback_records 中记录每次选择、每候选 G/R/score、采样数与 horizon。
-可据此检查是否真的更换过子目标、R 是否降低，而不是仅看最终成功率。
+旧日志只能检查编号选择和预测 R 的变化；第二轮新增的张量距离才能进一步判断
+候选子目标与动作是否不同，但仍不能替代真实执行轨迹分析。
 
 第一轮成功标准是：代码可运行、旧行为保留、记录完整、能判断反馈是否有价值。
 40 个任务上的一次提升不是论文结论；下一步需要独立验证集选参数、多种子统计、
@@ -146,3 +257,13 @@ git diff --check
 
 单元测试使用标准库和 CPU toy tensors，不训练模型、不加载数据、不运行 MuJoCo。
 完整 CUDA / MuJoCo 路径仍需在服务器执行 --smoke 后验证。
+
+第二轮本地检查：54 项测试通过，包含门控边界、非有限候选回退、候选差异记录、
+命令参数及连续两次规划的动作/warm start/RNG 回归；Python 3.9 语法检查与文档
+命令的 bash -n 检查通过。没有在 Mac 上运行真实训练或评估。
+
+对上传的第一轮旧日志中 10,093 条任务首次成功前（失败任务则全部）的记录回放，
+legacy 的选择全部复现。相同旧状态下，candidates_safe 在 medium/hard 分别选择
+60/2,049、85/2,972 次非零候选；feedback_safe 分别为 9/2,093、19/2,979 次。
+这说明默认约束很保守，可能接近 nominal 行为；**这些是旧状态的选择次数，不是新策略
+的成功率，也不能预测其完整轨迹**。没有根据这些回放结果重新调整默认阈值。

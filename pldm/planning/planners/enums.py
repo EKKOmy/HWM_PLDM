@@ -15,6 +15,16 @@ class SubgoalFeedbackConfig(ConfigBase):
     enabled: bool = False
     num_candidates: int = 3
     weight: float = 1.0
+    # Keep v1 behavior unless a new policy is explicitly requested.
+    selection_mode: str = "legacy"  # legacy / tolerance / conservative
+    score_atol: float = 1e-5
+    score_rtol: float = 1e-4
+    # Uncalibrated engineering defaults, not values optimized on test outcomes.
+    reach_trigger: float = 0.1
+    reach_improvement_atol: float = 1e-5
+    reach_improvement_rtol: float = 0.1
+    goal_degradation_atol: float = 1e-6
+    goal_degradation_rtol: float = 0.0
 
     def __post_init__(self):
         import math
@@ -23,6 +33,18 @@ class SubgoalFeedbackConfig(ConfigBase):
             raise ValueError("feedback.num_candidates must be >= 1")
         if not math.isfinite(self.weight) or self.weight < 0:
             raise ValueError("feedback.weight must be finite and >= 0")
+        if self.selection_mode not in ("legacy", "tolerance", "conservative"):
+            raise ValueError("Unknown feedback.selection_mode")
+        for name in (
+            "score_atol", "score_rtol", "reach_trigger",
+            "reach_improvement_atol", "reach_improvement_rtol",
+            "goal_degradation_atol", "goal_degradation_rtol",
+        ):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"feedback.{name} must be finite and >= 0")
+        if self.reach_improvement_rtol >= 1:
+            raise ValueError("feedback.reach_improvement_rtol must be < 1")
 
 
 @dataclass
